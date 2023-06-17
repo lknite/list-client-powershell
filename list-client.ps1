@@ -128,7 +128,59 @@ while ($WebSocket.State -eq "Open") {
     $Connection = $WebSocket.ReceiveAsync($Recv, $CancellationToken)
     while (!$Connection.IsCompleted) { 
         # While we wait for new data work on lists
+        foreach ($List in $Lists.Keys) {
+            # Check for backoff & check if backoff interval has passed
+            if ($Lists[$List] -ne "active") {
+                # If backoff interval has passed, set as active again
+                if ((Get-Date) -gt $Lists[$List]) {
+                    $Lists[$List] = "active"
 
+                    # Restart foreach to avoid 'Collection was modified' exception
+                    break
+                }
+                else {
+                    # Otherwise skip until backoff interval has passed
+                    continue
+                }
+            }
+
+            try {
+                # Get a block to work on
+                $Block = Invoke-RestMethod `
+                        -Method Post `
+                        -Headers @{ "X-API-KEY" = $Env:API_KEY } `
+                        "$($Proto)://$($ListServer)/block?list=$($List)"
+            }
+            catch {
+                $_.Exception.Response.StatusCode.value__
+
+                # If block not found, set a backoff interval to wait before processing again
+                if ($_.Exception.Response.StatusCode.value__ -eq 404) {
+                    $Lists[$List] = (Get-Date).AddMinutes(1);
+
+                    # Restart foreach to avoid 'Collection was modified' exception
+                    break
+                }
+            }
+            
+            try {
+                # For each block index, process
+                for ([int]$Index = [int]$Block.index; [int]$Index -lt ([int]$Block.index + [int]$Block.size); [int]$Index ++) {
+                    Write-Host "(List: $($List)) Processing task: $($Block.task) action: $($Block.action) index: $($Index) ..."
+                }
+
+                # If no errors, upon completion check block back in as complete
+                $Result = Invoke-RestMethod `
+                        -Method Patch `
+                        -Headers @{ "X-API-KEY" = $Env:API_KEY } `
+                        "$($Proto)://$($ListServer)/block?block=$($Block.block)"
+                Write-Host "$($Proto)://$($ListServer)/block?block=$($Block.block)"
+            }
+            catch {
+                Write-Error "error processing block: $($Block.index), list: $($List)"
+                Write-Error $_
+            }
+        }
 
         # Avoid maxing the cpu if there are no lists to work on, or if processing is very quick
         Start-Sleep -Milliseconds 100 
@@ -150,15 +202,10 @@ while ($WebSocket.State -eq "Open") {
 
             # track this list
             $Lists[$o.list] = $o.event
-
-            <#
-            # get list details
-            Write-Host "$($Proto)://$($ListServer)/list?list=$($o.list)"
-            $Result = Invoke-RestMethod `
-                    -Method Get `
-                    -Headers @{ "X-API-KEY" = $Env:API_KEY } `
-                    "$($Proto)://$($ListServer)/list?list=$($o.list)"
-            #>
+        }
+        "complete" {
+            # track this list
+            $Lists.Remove($o.list)
         }
         # For now, by default ignore other list states
         default {
